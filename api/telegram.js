@@ -10,7 +10,7 @@ import {
   sumForDate,
   ensureLedger,
 } from "../lib/ledger.js";
-import { encodePayload, decodePayload, hasPayload } from "../lib/payload.js";
+import { encodePayload, decodePayload, escapeHtml } from "../lib/payload.js";
 import {
   sendMessage,
   editMessageText,
@@ -70,23 +70,6 @@ function itemLabel(item) {
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
-    // TEMP diagnostic: GET /api/telegram?diag=1 reports whether the secret env var
-    // is present and its length (never the value). If you also send the header
-    // x-telegram-bot-api-secret-token, it reports whether that header MATCHES the
-    // env var. Remove after debugging.
-    if (req.query && req.query.diag === "1") {
-      const s = process.env.TELEGRAM_WEBHOOK_SECRET;
-      const incoming = req.headers["x-telegram-bot-api-secret-token"];
-      res.status(200).json({
-        hasSecret: typeof s === "string" && s.length > 0,
-        secretLen: typeof s === "string" ? s.length : 0,
-        incomingHeaderPresent: typeof incoming === "string",
-        incomingHeaderLen: typeof incoming === "string" ? incoming.length : 0,
-        headerMatches: typeof s === "string" && incoming === s,
-        node: process.version,
-      });
-      return;
-    }
     res.status(200).send("ok");
     return;
   }
@@ -189,7 +172,8 @@ async function handleMessage(message) {
   });
 
   const receipt = `Log this?\n${lines.join("\n")}`;
-  const body = receipt + encodePayload(items);
+  // Escape the human text for HTML parse mode, then append the invisible payload anchor.
+  const body = escapeHtml(receipt) + encodePayload(items);
   await sendMessage(chatId, body, { keyboard: CONFIRM_KEYBOARD, html: true });
 }
 
@@ -288,7 +272,7 @@ async function readMonthTotal(tab) {
 async function handleCallback(cb) {
   const chatId = cb.message?.chat?.id;
   const messageId = cb.message?.message_id;
-  const messageText = cb.message?.text || "";
+  const message = cb.message;
   const data = cb.data;
 
   if (!chatId) {
@@ -314,12 +298,7 @@ async function handleCallback(cb) {
   }
 
   // Idempotency: if the payload is gone, this was already logged.
-  if (!hasPayload(messageText)) {
-    await answerCallbackQuery(cb.id, "Already logged");
-    return;
-  }
-
-  const items = decodePayload(messageText);
+  const items = decodePayload(message);
   if (!items || items.length === 0) {
     await answerCallbackQuery(cb.id, "Already logged");
     return;
@@ -343,13 +322,12 @@ async function handleCallback(cb) {
     }
   } catch (err) {
     console.error("confirm write error:", err);
-    // Keep the payload intact so the user can retry after fixing access.
-    await editMessageText(
-      chatId,
-      messageId,
-      `⚠ Couldn't log: ${err.message}\n\n${messageText}`,
-      { keyboard: CONFIRM_KEYBOARD }
-    );
+    // Keep the (invisible) payload intact so the user can retry after fixing access.
+    const retryBody = escapeHtml(`⚠ Couldn't log: ${err.message}`) + encodePayload(items);
+    await editMessageText(chatId, messageId, retryBody, {
+      keyboard: CONFIRM_KEYBOARD,
+      html: true,
+    });
     return;
   }
 
