@@ -325,17 +325,32 @@ async function handleCallback(cb) {
     return;
   }
 
-  await ensureLedger();
+  // Stop Telegram's loading spinner immediately, then do the (slower) writes.
+  await answerCallbackQuery(cb.id, "Working…");
 
-  const results = [];
-  for (const item of items) {
-    try {
-      const r = await writeItem(item);
-      results.push(r);
-    } catch (err) {
-      console.error("writeItem error:", err);
-      results.push({ ok: false, label: itemLabel(item), error: err.message });
+  let results;
+  try {
+    await ensureLedger();
+    results = [];
+    for (const item of items) {
+      try {
+        const r = await writeItem(item);
+        results.push(r);
+      } catch (err) {
+        console.error("writeItem error:", err);
+        results.push({ ok: false, label: itemLabel(item), error: err.message });
+      }
     }
+  } catch (err) {
+    console.error("confirm write error:", err);
+    // Keep the payload intact so the user can retry after fixing access.
+    await editMessageText(
+      chatId,
+      messageId,
+      `⚠ Couldn't log: ${err.message}\n\n${messageText}`,
+      { keyboard: CONFIRM_KEYBOARD }
+    );
+    return;
   }
 
   const lines = results.map((r) => {
@@ -345,7 +360,6 @@ async function handleCallback(cb) {
   const receipt = `logged ✓\n${lines.join("\n")}`;
   // Edit WITHOUT payload + WITHOUT keyboard → idempotent.
   await editMessageText(chatId, messageId, receipt);
-  await answerCallbackQuery(cb.id, "Logged");
 }
 
 /** Resolve + write a single item to the formula cell and the ledger. Returns a result. */
