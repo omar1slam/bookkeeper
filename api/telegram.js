@@ -71,12 +71,18 @@ function itemLabel(item) {
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     // TEMP diagnostic: GET /api/telegram?diag=1 reports whether the secret env var
-    // is present and its length (never the value). Remove after debugging.
+    // is present and its length (never the value). If you also send the header
+    // x-telegram-bot-api-secret-token, it reports whether that header MATCHES the
+    // env var. Remove after debugging.
     if (req.query && req.query.diag === "1") {
       const s = process.env.TELEGRAM_WEBHOOK_SECRET;
+      const incoming = req.headers["x-telegram-bot-api-secret-token"];
       res.status(200).json({
         hasSecret: typeof s === "string" && s.length > 0,
         secretLen: typeof s === "string" ? s.length : 0,
+        incomingHeaderPresent: typeof incoming === "string",
+        incomingHeaderLen: typeof incoming === "string" ? incoming.length : 0,
+        headerMatches: typeof s === "string" && incoming === s,
         node: process.version,
       });
       return;
