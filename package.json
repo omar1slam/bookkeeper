@@ -1,0 +1,9 @@
+{
+  "name": "budget-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "google-auth-library": "^9.14.0"
+  }
+}
