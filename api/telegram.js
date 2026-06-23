@@ -11,6 +11,7 @@ import {
   ensureLedger,
 } from "../lib/ledger.js";
 import { encodePayload, decodePayload, escapeHtml } from "../lib/payload.js";
+import { convertToEgp, normalizeCurrency } from "../lib/fx.js";
 import {
   sendMessage,
   editMessageText,
@@ -162,13 +163,39 @@ async function handleMessage(message) {
   // Build a human receipt + hidden payload, attach to each item the raw message.
   for (const it of items) it.raw_message = text;
 
+  // Convert any non-EGP item to EGP at today's rate, locking the rate into the payload.
+  // We overwrite amount/currency with the EGP values so every downstream step
+  // (resolution, append, ledger, undo) operates in EGP; the original is kept for the note.
+  for (const it of items) {
+    const cur = normalizeCurrency(it.currency);
+    if (cur !== DEFAULT_CURRENCY) {
+      try {
+        const { egpAmount, rate } = await convertToEgp(it.amount, cur);
+        it.fx_orig_amount = it.amount;
+        it.fx_orig_currency = cur;
+        it.fx_rate = rate;
+        it.amount = egpAmount;
+        it.currency = DEFAULT_CURRENCY;
+      } catch (err) {
+        console.error("fx error:", err);
+        it.needs_clarification = true;
+        it.clarification = `Couldn't get an FX rate for ${cur}; reply with the EGP amount.`;
+      }
+    }
+  }
+
   const lines = items.map((it) => {
     const where = it.category_key && CATEGORIES[it.category_key]
       ? `${CATEGORIES[it.category_key].section} / ${itemLabel(it)}`
       : `${it.section} / ${itemLabel(it)}`;
-    const cur = it.currency && it.currency !== DEFAULT_CURRENCY ? ` ${it.currency}` : "";
     const flag = it.needs_clarification ? `  ⚠ ${it.clarification || "needs review"}` : "";
-    return `• ${fmtNumber(it.amount)}${cur} → ${where} (${it.date})${flag}`;
+    let amountText;
+    if (it.fx_orig_currency) {
+      amountText = `${fmtNumber(it.amount)} EGP (${fmtNumber(it.fx_orig_amount)} ${it.fx_orig_currency} @ ${it.fx_rate})`;
+    } else {
+      amountText = `${fmtNumber(it.amount)} EGP`;
+    }
+    return `• ${amountText} → ${where} (${it.date})${flag}`;
   });
 
   const receipt = `Log this?\n${lines.join("\n")}`;
@@ -365,6 +392,13 @@ async function writeItem(item) {
   // Read back the computed total for the receipt.
   const computed = (await getValues(cellRef, { render: "UNFORMATTED_VALUE" }))?.[0]?.[0];
 
+  // Fold FX origin into the note when the amount was converted.
+  let note = item.note || "";
+  if (item.fx_orig_currency) {
+    const fx = `${item.fx_orig_amount} ${item.fx_orig_currency} @ ${item.fx_rate}`;
+    note = note ? `${note} (${fx})` : fx;
+  }
+
   // Ledger row.
   await appendTransaction({
     date: item.date || todayISO(),
@@ -379,7 +413,7 @@ async function writeItem(item) {
       item.category_key && CATEGORIES[item.category_key]
         ? CATEGORIES[item.category_key].label
         : item.label || "",
-    note: item.note || "",
+    note,
     raw_message: item.raw_message || "",
     source: "telegram",
     tab,
