@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "type": "module",
   "private": true,
+  "scripts": {
+    "test": "node --test"
+  },
   "dependencies": {
     "google-auth-library": "^9.14.0"
   }

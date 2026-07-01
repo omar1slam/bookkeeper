@@ -1,5 +1,5 @@
 import { parseMessage } from "../lib/parse.js";
-import { resolveTargetCell } from "../lib/resolve.js";
+import { resolveTargetCell, getVacationAlias } from "../lib/resolve.js";
 import { appendAmount, removeLastTerm } from "../lib/formula.js";
 import { getValues, updateValue } from "../lib/sheets.js";
 import { CATEGORIES } from "../lib/categories.js";
@@ -144,11 +144,20 @@ async function handleMessage(message) {
     return;
   }
 
+  // Trip name written on the VACATION header (e.g. "sahel"); fail-open if unreadable.
+  let vacationAlias = null;
+  try {
+    vacationAlias = await getVacationAlias(tabNameForDate(todayISO()));
+  } catch (err) {
+    console.error("vacation alias:", err);
+  }
+
   // Parse free-form expense text.
   const { items, reply } = await parseMessage(text, {
     todayISO: todayISO(),
     tz: TZ,
     defaultCurrency: DEFAULT_CURRENCY,
+    vacationAlias,
   });
 
   if (reply) {
