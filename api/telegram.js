@@ -1,8 +1,11 @@
 import { parseMessage } from "../lib/parse.js";
+import { fastParse } from "../lib/fastparse.js";
 import { resolveTargetCell, getVacationAlias } from "../lib/resolve.js";
 import { appendAmount, removeLastTerm } from "../lib/formula.js";
 import { getValues, updateValue } from "../lib/sheets.js";
 import { CATEGORIES } from "../lib/categories.js";
+import { readMonthSummary, summaryLines, capitalize } from "../lib/summary.js";
+import { TZ, todayISO, tabNameForDate, fmtNumber } from "../lib/dates.js";
 import {
   appendTransaction,
   readLast,
@@ -19,47 +22,10 @@ import {
   CONFIRM_KEYBOARD,
 } from "../lib/telegram.js";
 
-const TZ = process.env.DEFAULT_TZ || "Africa/Cairo";
 const DEFAULT_CURRENCY = process.env.DEFAULT_CURRENCY || "EGP";
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 // Best-effort dedupe of webhook retries within a warm instance (not durable).
 const seenUpdates = new Set();
-
-// ---------- date / formatting helpers ----------
-
-/** Today's date parts in the configured timezone. */
-function nowInTz() {
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: TZ,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  const parts = Object.fromEntries(fmt.formatToParts(new Date()).map((p) => [p.type, p.value]));
-  return { year: Number(parts.year), month: Number(parts.month), day: Number(parts.day) };
-}
-
-function todayISO() {
-  const { year, month, day } = nowInTz();
-  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-}
-
-/** "Jun 2026" tab name for a YYYY-MM-DD date string. */
-function tabNameForDate(dateISO) {
-  const [y, m] = String(dateISO).split("-").map(Number);
-  if (!y || !m) {
-    const t = nowInTz();
-    return `${MONTHS[t.month - 1]} ${t.year}`;
-  }
-  return `${MONTHS[m - 1]} ${y}`;
-}
-
-function fmtNumber(n) {
-  const num = Number(n);
-  if (!isFinite(num)) return String(n);
-  return num.toLocaleString("en-US", { maximumFractionDigits: 2 });
-}
 
 /** Human label for an item (category label or freeform label). */
 function itemLabel(item) {
@@ -152,13 +118,21 @@ async function handleMessage(message) {
     console.error("vacation alias:", err);
   }
 
-  // Parse free-form expense text.
-  const { items, reply } = await parseMessage(text, {
+  // Zero-LLM fast path for trivial messages; falls through to the LLM parser.
+  const fast = fastParse(text, {
     todayISO: todayISO(),
-    tz: TZ,
     defaultCurrency: DEFAULT_CURRENCY,
     vacationAlias,
   });
+  console.log(fast ? "fastparse: hit" : "fastparse: miss (LLM)");
+  const { items, reply } =
+    fast ??
+    (await parseMessage(text, {
+      todayISO: todayISO(),
+      tz: TZ,
+      defaultCurrency: DEFAULT_CURRENCY,
+      vacationAlias,
+    }));
 
   if (reply) {
     await sendMessage(chatId, reply);
@@ -234,7 +208,9 @@ async function handleCommand(chatId, text) {
           "Commands:",
           "/undo — remove the last logged expense",
           "/today — today's total",
-          "/month — this month's total expenses",
+          "/month — this month's expenses per section",
+          "/status — actual vs budget per section",
+          "/trip — current vacation's expenses",
         ].join("\n")
       );
       return;
@@ -246,6 +222,12 @@ async function handleCommand(chatId, text) {
       return;
     case "/month":
       await handleMonth(chatId);
+      return;
+    case "/status":
+      await handleStatus(chatId);
+      return;
+    case "/trip":
+      await handleTrip(chatId);
       return;
     default:
       await sendMessage(chatId, "Unknown command. Try /help.");
@@ -281,26 +263,69 @@ async function handleToday(chatId) {
 
 async function handleMonth(chatId) {
   const tab = tabNameForDate(todayISO());
-  const total = await readMonthTotal(tab);
-  if (total == null) {
-    await sendMessage(chatId, `Couldn't read the total for ${tab}.`);
+  let summary;
+  try {
+    summary = await readMonthSummary(tab);
+  } catch (err) {
+    console.error("month error:", err);
+    await sendMessage(chatId, `Couldn't read ${tab}.`);
     return;
   }
-  await sendMessage(chatId, `${tab} total expenses: ${fmtNumber(total)} ${DEFAULT_CURRENCY}.`);
+  const lines = summaryLines(summary, { showBudget: false });
+  const totalLine = summary.total
+    ? `Total: ${fmtNumber(summary.total.actual)} ${DEFAULT_CURRENCY}`
+    : null;
+  await sendMessage(chatId, [`${tab} expenses`, ...lines, "—", totalLine].filter(Boolean).join("\n"));
 }
 
-/** Locate the bottom TOTAL row in the expenses block and read its computed col-I value. */
-async function readMonthTotal(tab) {
-  const gValues = await getValues(`'${tab}'!G1:G80`, { render: "UNFORMATTED_VALUE" });
-  let totalRow = null;
-  for (let i = 0; i < gValues.length; i++) {
-    const cell = gValues[i] && gValues[i][0];
-    if (cell == null) continue;
-    if (/^total/i.test(String(cell).trim())) totalRow = i + 1; // take the last TOTAL match
+async function handleStatus(chatId) {
+  const tab = tabNameForDate(todayISO());
+  let summary;
+  try {
+    summary = await readMonthSummary(tab);
+  } catch (err) {
+    console.error("status error:", err);
+    await sendMessage(chatId, `Couldn't read ${tab}.`);
+    return;
   }
-  if (!totalRow) return null;
-  const v = (await getValues(`'${tab}'!I${totalRow}`, { render: "UNFORMATTED_VALUE" }))?.[0]?.[0];
-  return v == null ? null : Number(v);
+  const lines = summaryLines(summary, { showBudget: true });
+  let totalLine = null;
+  if (summary.total) {
+    totalLine = `Total: ${fmtNumber(summary.total.actual)}`;
+    if (summary.total.budget != null) {
+      totalLine += ` / ${fmtNumber(summary.total.budget)}`;
+      if (summary.total.actual > summary.total.budget) {
+        totalLine += ` ⚠ over by ${fmtNumber(summary.total.actual - summary.total.budget)}`;
+      }
+    }
+    totalLine += ` ${DEFAULT_CURRENCY}`;
+  }
+  await sendMessage(chatId, [`${tab} status (actual / budget)`, ...lines, "—", totalLine].filter(Boolean).join("\n"));
+}
+
+async function handleTrip(chatId) {
+  const tab = tabNameForDate(todayISO());
+  let summary;
+  try {
+    summary = await readMonthSummary(tab);
+  } catch (err) {
+    console.error("trip error:", err);
+    await sendMessage(chatId, `Couldn't read ${tab}.`);
+    return;
+  }
+  const vac = summary.vacation;
+  if (!vac) {
+    await sendMessage(chatId, `No VACATION section in ${tab}.`);
+    return;
+  }
+  const rows = vac.rows.filter((r) => r.amount !== 0);
+  if (rows.length === 0) {
+    await sendMessage(chatId, `No vacation expenses logged in ${tab}.`);
+    return;
+  }
+  const title = vac.alias ? `${capitalize(vac.alias)} trip — ${tab}` : `Vacation — ${tab}`;
+  const lines = rows.map((r) => `• ${r.label}: ${fmtNumber(r.amount)}`);
+  await sendMessage(chatId, [title, ...lines, `Total: ${fmtNumber(vac.total)} ${DEFAULT_CURRENCY}`].join("\n"));
 }
 
 // ---------- callback (confirm / cancel) ----------
@@ -369,7 +394,14 @@ async function handleCallback(cb) {
 
   const lines = results.map((r) => {
     if (!r.ok) return `• ⚠ ${r.label}: ${r.error}`;
-    return `• ${r.label} is now ${fmtNumber(r.newTotal)}`;
+    let line = `• ${r.label} is now ${fmtNumber(r.newTotal)}`;
+    if (r.remaining != null) {
+      line +=
+        r.remaining >= 0
+          ? ` — ${fmtNumber(r.remaining)} left this month`
+          : ` — ⚠ ${fmtNumber(-r.remaining)} over budget`;
+    }
+    return line;
   });
   const receipt = `logged ✓\n${lines.join("\n")}`;
   // Edit WITHOUT payload + WITHOUT keyboard → idempotent.
@@ -398,8 +430,19 @@ async function writeItem(item) {
     await updateValue(cellRef, newFormula);
   }
 
-  // Read back the computed total for the receipt.
-  const computed = (await getValues(cellRef, { render: "UNFORMATTED_VALUE" }))?.[0]?.[0];
+  // Read back budget (col H) + computed total (col I) in one call for the receipt.
+  const hi = (await getValues(`'${tab}'!H${resolved.rowIndex}:I${resolved.rowIndex}`, {
+    render: "UNFORMATTED_VALUE",
+  }))?.[0] ?? [];
+  const budgetRaw = hi[0];
+  const budget =
+    budgetRaw != null && budgetRaw !== "" && Number.isFinite(Number(budgetRaw))
+      ? Number(budgetRaw)
+      : null;
+  const computed = hi.length > 1 ? hi[1] : undefined;
+  const newTotal = computed ?? item.amount;
+  const remaining =
+    budget != null && Number.isFinite(Number(newTotal)) ? budget - Number(newTotal) : null;
 
   // Fold FX origin into the note when the amount was converted.
   let note = item.note || "";
@@ -429,5 +472,5 @@ async function writeItem(item) {
     cell_ref: cellRef,
   });
 
-  return { ok: true, label: itemLabel(item), newTotal: computed ?? item.amount };
+  return { ok: true, label: itemLabel(item), newTotal, remaining };
 }
