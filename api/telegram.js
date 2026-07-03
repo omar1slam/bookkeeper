@@ -1,6 +1,6 @@
 import { parseMessage } from "../lib/parse.js";
 import { fastParse } from "../lib/fastparse.js";
-import { resolveTargetCell, getVacationAlias } from "../lib/resolve.js";
+import { resolveTargetCell, getVacationContext } from "../lib/resolve.js";
 import { appendAmount, removeLastTerm } from "../lib/formula.js";
 import { getValues, updateValue } from "../lib/sheets.js";
 import { CATEGORIES } from "../lib/categories.js";
@@ -110,19 +110,19 @@ async function handleMessage(message) {
     return;
   }
 
-  // Trip name written on the VACATION header (e.g. "sahel"); fail-open if unreadable.
-  let vacationAlias = null;
+  // Vacation context (trip name + existing section rows); fail-open if unreadable.
+  let vacationContext = { alias: null, labels: [] };
   try {
-    vacationAlias = await getVacationAlias(tabNameForDate(todayISO()));
+    vacationContext = await getVacationContext(tabNameForDate(todayISO()));
   } catch (err) {
-    console.error("vacation alias:", err);
+    console.error("vacation context:", err);
   }
 
   // Zero-LLM fast path for trivial messages; falls through to the LLM parser.
   const fast = fastParse(text, {
     todayISO: todayISO(),
     defaultCurrency: DEFAULT_CURRENCY,
-    vacationAlias,
+    vacationAlias: vacationContext.alias,
   });
   console.log(fast ? "fastparse: hit" : "fastparse: miss (LLM)");
   const { items, reply } =
@@ -131,7 +131,7 @@ async function handleMessage(message) {
       todayISO: todayISO(),
       tz: TZ,
       defaultCurrency: DEFAULT_CURRENCY,
-      vacationAlias,
+      vacationContext,
     }));
 
   if (reply) {
@@ -451,6 +451,12 @@ async function writeItem(item) {
     note = note ? `${note} (${fx})` : fx;
   }
 
+  // Prefix-matched freeform row ("utilities sunscreen" → row "Utilities"):
+  // keep the leftover words as part of the note so the detail isn't lost.
+  if (resolved.labelRemainder) {
+    note = note ? `${resolved.labelRemainder}, ${note}` : resolved.labelRemainder;
+  }
+
   // Ledger row.
   await appendTransaction({
     date: item.date || todayISO(),
@@ -464,7 +470,7 @@ async function writeItem(item) {
     label:
       item.category_key && CATEGORIES[item.category_key]
         ? CATEGORIES[item.category_key].label
-        : item.label || "",
+        : resolved.matchedLabel || item.label || "",
     note,
     raw_message: item.raw_message || "",
     source: "telegram",
@@ -472,5 +478,5 @@ async function writeItem(item) {
     cell_ref: cellRef,
   });
 
-  return { ok: true, label: itemLabel(item), newTotal, remaining };
+  return { ok: true, label: resolved.matchedLabel ?? itemLabel(item), newTotal, remaining };
 }

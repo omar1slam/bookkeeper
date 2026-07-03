@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { normalizeLabel, canonicalizeLabel } from "../lib/categories.js";
-import { matchesHeader, resolveFreeformSection } from "../lib/resolve.js";
+import { matchesHeader, resolveFreeformSection, findFreeformRow } from "../lib/resolve.js";
 import { appendAmount } from "../lib/formula.js";
 
 test("canonicalizeLabel treats & and 'and' as equivalent", () => {
@@ -37,6 +37,47 @@ test("resolveFreeformSection accepts the vacation alias", () => {
   // Without an alias, unknown names still fail.
   assert.equal(resolveFreeformSection("Sahel", { VACATION: { alias: null } }), null);
   assert.equal(resolveFreeformSection("Sahel", {}), null);
+});
+
+test("findFreeformRow matches exact labels and prefixes", () => {
+  // VACATION section: header row 10, rows 11-13, subtotal row 14.
+  const section = { headerRow: 10, startRow: 11, endRow: 20, subtotalRow: 14 };
+  const gRows = [
+    { row: 10, label: "VACATION - Sahel" },
+    { row: 11, label: "Food & Beverage" },
+    { row: 12, label: "Utilities" },
+    { row: 13, label: "Water Sports" },
+    { row: 14, label: "Subtotal" },
+    { row: 15, label: "TOTAL" }, // outside the section
+  ];
+
+  // Exact (with &/and equivalence).
+  assert.deepEqual(findFreeformRow(gRows, section, "food and beverage"), {
+    row: 11,
+    label: "Food & Beverage",
+    remainder: "",
+  });
+
+  // Prefix: leftover words become the remainder.
+  assert.deepEqual(findFreeformRow(gRows, section, "Utilities sunscreen"), {
+    row: 12,
+    label: "Utilities",
+    remainder: "sunscreen",
+  });
+
+  // Longest matching row label wins over a shorter one.
+  const gRows2 = [...gRows, { row: 13, label: "Water" }]; // hypothetical shorter sibling
+  const m = findFreeformRow(gRows2, section, "water sports rental");
+  assert.equal(m.label, "Water Sports");
+  assert.equal(m.remainder, "rental");
+
+  // No reversed or mid-string matches, no partial-word matches.
+  assert.equal(findFreeformRow(gRows, section, "sunscreen utilities"), null);
+  assert.equal(findFreeformRow(gRows, section, "utility bill"), null);
+
+  // Rows outside the section bounds are ignored.
+  assert.equal(findFreeformRow(gRows, section, "TOTAL"), null);
+  assert.equal(findFreeformRow(gRows, section, "vacation - sahel"), null);
 });
 
 test("appendAmount regression", () => {
